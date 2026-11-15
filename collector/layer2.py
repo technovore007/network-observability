@@ -9,10 +9,10 @@ from __future__ import annotations
 from datetime import datetime, timezone
 import re
 
-from collector.parsers.huawei_parser import parse_interface_information
 from collector.parsers.huawei_parser import (
     parse_interface_information,
     parse_mac_forwarding_table,
+    parse_wifi_neighbor,
 )
 
 NOKIA_LAN_CORRELATIONS = {
@@ -193,6 +193,7 @@ def _huawei_link_config(device, port_id):
 
     return speed, duplex, status
 
+
 def normalize_huawei(device):
     records = []
 
@@ -294,16 +295,23 @@ def normalize_huawei(device):
                 priority_policy=item.get("priority_policy"),
                 default_priority=item.get("default_priority"),
             ))
-        # MAC forwarding observations remain separate from interface records.
+    return records
+
+
+def normalize_huawei_forwarding(device):
+    """Normalize Huawei MAC forwarding-table observations separately."""
+
     commands = (device.get("extended") or {}).get("commands") or {}
     mac_command = commands.get("mac_forwarding_table") or {}
 
-    forwarding_entries = []
+    if str(mac_command.get("status") or "").lower() != "success":
+        return []
 
-    if str(mac_command.get("status") or "").lower() == "success":
-        forwarding_entries = parse_mac_forwarding_table(
-            mac_command.get("output") or ""
-        )
+    forwarding_entries = parse_mac_forwarding_table(
+        mac_command.get("output") or ""
+    )
+
+    records = []
 
     for entry in forwarding_entries:
         records.append(_record(
@@ -317,7 +325,9 @@ def normalize_huawei(device):
             physical=False,
             counters={},
             aggregate_eligible=False,
-            classification_confidence="CLI-reported MAC-to-port association",
+            classification_confidence=(
+                "CLI-reported MAC-to-port association"
+            ),
             mac_address=entry["mac_address"],
             vlan_id=entry["vlan_id"],
             learned_port_id=entry["port_id"],
@@ -325,8 +335,50 @@ def normalize_huawei(device):
             forwarding_entry_index=entry["index"],
             entry_type=entry["entry_type"],
         ))
+
     return records
 
+def normalize_huawei_wifi_neighbours(device):
+    """Normalize nearby Wi-Fi access points detected by the Huawei AP."""
+
+    extended = device.get("extended") or {}
+    commands = extended.get("commands") or {}
+    scan_command = commands.get("wifi_neighbor_scan") or {}
+
+    status = str(scan_command.get("status") or "").lower()
+
+    result = {
+        "collection_status": (
+            "success" if status == "success"
+            else "failed" if scan_command
+            else "not_collected"
+        ),
+        "collected_at": extended.get("collected_at"),
+        "scan_metadata": {
+            "reported_ap_count": None,
+            "parsed_ap_count": 0,
+            "current_working_channels": {
+                "2.4GHz": None,
+                "5GHz": None,
+            },
+        },
+        "access_points": [],
+    }
+
+    if status != "success":
+        return result
+
+    parsed = parse_wifi_neighbor(scan_command.get("output") or "")
+
+    result["scan_metadata"] = {
+        "reported_ap_count": parsed["reported_ap_count"],
+        "parsed_ap_count": parsed["parsed_ap_count"],
+        "current_working_channels": parsed["current_working_channels"],
+    }
+
+    result["access_points"] = parsed["access_points"]
+
+    return result
 
 def normalize_device(device_id, device):
     if device_id == "nokia":
@@ -399,16 +451,30 @@ class CounterRateTracker:
 
 
 def build_layer2(devices):
-    """Build normalized interface observations while retaining raw results."""
+    """Build normalized Layer 2 observations."""
+
     normalized = {}
+    forwarding_tables = {}
+    wifi_neighbours = {}
 
     for device_id, device in devices.items():
         normalized[device_id] = normalize_device(device_id, device)
+
+        if device_id == "huawei":
+            forwarding_tables["huawei"] = (
+                normalize_huawei_forwarding(device)
+            )
+
+            wifi_neighbours["huawei"] = (
+                normalize_huawei_wifi_neighbours(device)
+            )
 
     return {
         "schema_version": "1.0",
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "devices": normalized,
+        "forwarding_tables": forwarding_tables,
+        "wifi_neighbours": wifi_neighbours,
         "aggregation_policy": {
             "default": "no cross-interface aggregation",
             "nokia": (
@@ -418,7 +484,9 @@ def build_layer2(devices):
             ),
             "huawei": (
                 "physical LAN port counters and display-if logical "
-                "interfaces remain separate; LAN1 includes the Nokia uplink "
+                "interfaces remain separate; MAC forwarding observations "
+                "are stored independently; nearby Wi-Fi access points "
+                "are stored independently; LAN1 includes the Nokia uplink "
                 "and must not be added to Nokia WAN totals"
             ),
         },

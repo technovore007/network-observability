@@ -1,9 +1,9 @@
-
 """Unit tests for Layer 2 normalization and counter processing."""
 import unittest
 
 from collector.layer2 import (
     CounterRateTracker,
+    build_layer2,
     normalize_nokia,
     normalize_huawei,
 )
@@ -203,6 +203,105 @@ Link(0-Down, 1-Up) : 0"""
         self.assertEqual(record["operational_status"], "down")
         self.assertIsNone(record["speed_mbps"])
         self.assertIsNone(record["duplex"])
+
+    def test_huawei_mac_forwarding_table_is_separate_from_interfaces(self):
+        output = """display macaddress
+Index  Portid  Vlan  MAC-Address
+    1       3  4095  9C:A3:A9:82:F5:40
+    2       1  4095  24:0B:88:61:C0:10
+    3       2  4095  C8:7E:A1:C5:64:B4
+    4       1  4095  78:84:3C:34:99:3E
+success!
+SU_WAP>"""
+
+        device = {
+            "ethernet": [{
+                "port_id": 1,
+                "rx_bytes": 100,
+                "tx_bytes": 200,
+                "rx_packets": 10,
+                "tx_packets": 20,
+            }],
+            "extended": {
+                "commands": {
+                    "mac_forwarding_table": {
+                        "status": "success",
+                        "output": output,
+                    }
+                }
+            },
+        }
+
+        result = build_layer2({"huawei": device})
+
+        interface_records = result["devices"]["huawei"]
+        forwarding_records = result["forwarding_tables"]["huawei"]
+
+        # Interface collection contains the physical port, not MAC entries.
+        self.assertEqual(len(interface_records), 1)
+        self.assertEqual(interface_records[0]["interface_name"], "LAN1")
+        self.assertTrue(interface_records[0]["is_physical"])
+        self.assertTrue(all(
+            r["interface_type"] != "mac_forwarding_entry"
+            for r in interface_records
+        ))
+
+        # Forwarding observations are stored in their own collection.
+        self.assertEqual(len(forwarding_records), 4)
+        self.assertTrue(all(
+            r["interface_type"] == "mac_forwarding_entry"
+            for r in forwarding_records
+        ))
+
+        self.assertEqual(
+            [r["learned_interface"] for r in forwarding_records],
+            ["LAN3", "LAN1", "LAN2", "LAN1"],
+        )
+        self.assertEqual(
+            [r["vlan_id"] for r in forwarding_records],
+            [4095, 4095, 4095, 4095],
+        )
+        self.assertEqual(
+            forwarding_records[0]["mac_address"],
+            "9C:A3:A9:82:F5:40",
+        )
+        self.assertEqual(forwarding_records[1]["learned_port_id"], 1)
+        self.assertEqual(forwarding_records[3]["entry_type"], "unknown")
+
+        for record in forwarding_records:
+            self.assertFalse(record["is_physical"])
+            self.assertFalse(record["aggregate_eligible"])
+            self.assertTrue(all(
+                value is None
+                for value in record["counters"].values()
+            ))
+
+    def test_huawei_missing_or_failed_forwarding_command_returns_empty_list(self):
+        missing_command_result = build_layer2({
+            "huawei": {"ethernet": []}
+        })
+        self.assertEqual(
+            missing_command_result["forwarding_tables"]["huawei"],
+            [],
+        )
+
+        failed_command_result = build_layer2({
+            "huawei": {
+                "ethernet": [],
+                "extended": {
+                    "commands": {
+                        "mac_forwarding_table": {
+                            "status": "error",
+                            "output": "command failed",
+                        }
+                    }
+                },
+            }
+        })
+        self.assertEqual(
+            failed_command_result["forwarding_tables"]["huawei"],
+            [],
+        )
 
     def test_rate_baseline_then_rate(self):
         tracker = CounterRateTracker()

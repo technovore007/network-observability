@@ -1,4 +1,6 @@
 
+"""Interactive SSH shell diagnostics for Nokia and Huawei routers."""
+
 import os
 import time
 import paramiko
@@ -43,7 +45,7 @@ def read_shell(channel, timeout=10, idle=0.8):
     return "".join(output)
 
 
-def test_router(name, config):
+def run_router_test(name, config):
     password = os.environ.get(f"{name.upper()}_PASSWORD")
 
     if not password:
@@ -100,4 +102,4 @@ def test_router(name, config):
 
 if __name__ == "__main__":
     for name, config in ROUTERS.items():
-        test_router(name, config)
+        run_router_test(name, config)

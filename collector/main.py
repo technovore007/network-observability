@@ -1,3 +1,4 @@
+
 """Network Observability Dashboard - Application entry point."""
 
 import argparse
@@ -32,7 +33,11 @@ ROUTERS = {
 }
 
 
-def collect_from_router(name, config, include_neighbor_scan=False):
+def collect_from_router(
+    name,
+    config,
+    include_huawei_neighbor_scan=False,
+):
     """Collect all implemented telemetry from one router."""
 
     password = os.getenv(f"{name.upper()}_PASSWORD")
@@ -59,19 +64,22 @@ def collect_from_router(name, config, include_neighbor_scan=False):
         # Nokia-only inventories and interface telemetry.
         network_metrics = None
         hosts_metrics = None
+
         if name == "nokia":
             network_metrics = router.collect_network_interfaces()
             hosts_metrics = router.collect_hosts()
 
         logger.info("Collecting extended telemetry from %s", name)
+
         if name == "huawei":
             extended_metrics = router.collect_extended_telemetry(
-                include_neighbor_scan=include_neighbor_scan,
+                include_neighbor_scan=include_huawei_neighbor_scan,
                 wifi_clients=wifi_metrics["clients"],
             )
         else:
+            # Nokia's nearby-AP scan remains disabled.
             extended_metrics = router.collect_extended_telemetry(
-                include_neighbor_scan=include_neighbor_scan,
+                include_neighbor_scan=False,
             )
 
         optional_failures = [
@@ -114,31 +122,39 @@ def main():
     parser = argparse.ArgumentParser(
         description="Collect telemetry from Nokia and Huawei routers."
     )
+
     parser.add_argument(
-        "--include-neighbor-scans",
+        "--include-huawei-neighbor-scan",
         action="store_true",
         help=(
-            "Run nearby Wi-Fi AP scans. Nokia's wlan scan writes to flash; "
-            "use sparingly rather than on every collection cycle."
+            "Run Huawei's nearby Wi-Fi scan using "
+            "'display wifi neighbor'. This scan is opt-in; "
+            "avoid running it during frequent collection cycles."
         ),
     )
+
     args = parser.parse_args()
 
     results = {}
+
     for name, config in ROUTERS.items():
         result = collect_from_router(
             name,
             config,
-            include_neighbor_scan=args.include_neighbor_scans,
+            include_huawei_neighbor_scan=(
+                args.include_huawei_neighbor_scan
+            ),
         )
+
         if result is not None:
             results[name] = result
 
     collected_device_count = len(results)
+
     if results:
         results["_layer2"] = build_layer2(results)
 
-    print("\\n========== TELEMETRY RESULTS ==========")
+    print("\n========== TELEMETRY RESULTS ==========")
     print(json.dumps(results, indent=4))
 
     if collected_device_count != len(ROUTERS):

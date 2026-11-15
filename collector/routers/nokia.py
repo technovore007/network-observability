@@ -1,3 +1,4 @@
+
 """Nokia G-2425G-A router interface."""
 
 from datetime import datetime, timezone
@@ -13,7 +14,6 @@ class NokiaRouter(SSHRouter):
             host=host,
             username=username,
             password=password,
-            # Correct escaping: match user>, user#, user(show)#.
             prompt_pattern=r"user(?:\(show\))?[>#]",
             timeout=timeout,
         )
@@ -44,7 +44,7 @@ class NokiaRouter(SSHRouter):
     def collect_ethernet_metrics(self):
         """Collect Nokia Ethernet interface statistics."""
         collected_at = datetime.now(timezone.utc).isoformat()
-        output = self.execute("lan stats")
+        output = self.execute("lan stats", timeout=30)
 
         return {
             "device": "nokia",

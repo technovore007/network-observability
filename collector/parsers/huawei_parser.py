@@ -166,20 +166,23 @@ def parse_interface_information(output: str) -> list[dict]:
     return interfaces
 
 
+
 def parse_mac_forwarding_table(output: str) -> list[dict]:
     """Parse Huawei display macaddress forwarding-table output.
 
     Each record represents a MAC address learned on a VLAN and port.
     The CLI output does not establish whether an entry is static or dynamic.
+    Handles CLI status text appearing before a table row.
     """
     import re
 
     entries = []
 
     row_pattern = re.compile(
-        r"^\s*(\d+)\s+(\d+)\s+(\d+)\s+"
-        r"([0-9A-Fa-f]{2}(?::[0-9A-Fa-f]{2}){5})\s*$",
-        re.MULTILINE,
+        r"^[ \t]*(?:success![ \t]*)?"
+        r"(\d+)\s+(\d+)\s+(\d+)\s+"
+        r"([0-9A-Fa-f]{2}(?::[0-9A-Fa-f]{2}){5})[ \t]*$",
+        re.MULTILINE | re.IGNORECASE,
     )
 
     for match in row_pattern.finditer(output or ""):
@@ -197,7 +200,6 @@ def parse_mac_forwarding_table(output: str) -> list[dict]:
         })
 
     return entries
-
 
 def parse_wifi_associate(output: str) -> list[dict]:
     """Parse Huawei Wi-Fi associated station information."""
@@ -282,3 +284,146 @@ def parse_wifi_associate(output: str) -> list[dict]:
         })
 
     return clients
+
+
+def parse_wifi_neighbor(output: str) -> dict:
+    """Parse Huawei display wifi neighbor scan output.
+
+    Uses the CLI table header's column positions instead of split(), because
+    SSIDs can contain spaces or be empty.
+    """
+    output = output or ""
+
+    result = {
+        "reported_ap_count": None,
+        "parsed_ap_count": 0,
+        "current_working_channels": {
+            "2.4GHz": None,
+            "5GHz": None,
+        },
+        "access_points": [],
+    }
+
+    channel_match = re.search(
+        r"CurrentWorkingChannel:\s*(\d+)\s*\(2\.4G\)\s*"
+        r"(\d+)\s*\(5G\)",
+        output,
+        re.IGNORECASE,
+    )
+
+    if channel_match:
+        result["current_working_channels"] = {
+            "2.4GHz": int(channel_match.group(1)),
+            "5GHz": int(channel_match.group(2)),
+        }
+
+    count_match = re.search(
+        r"Neighbor\s+ap\s+number\s*:\s*(\d+)",
+        output,
+        re.IGNORECASE,
+    )
+
+    if count_match:
+        result["reported_ap_count"] = int(count_match.group(1))
+
+    lines = output.splitlines()
+
+    header_index = None
+    column_starts = {}
+
+    expected_columns = (
+        "Mac",
+        "SSID",
+        "Channel",
+        "BandWidth",
+        "MIMO",
+        "RSSI",
+        "Mode",
+        "Security",
+        "WMM",
+        "Noise",
+        "MaxBitRate",
+    )
+
+    for index, line in enumerate(lines):
+        matches = {
+            match.group(): match.start()
+            for match in re.finditer(r"\S+", line)
+        }
+
+        if all(column in matches for column in expected_columns):
+            header_index = index
+            column_starts = matches
+            break
+
+    if header_index is None:
+        return result
+
+    def get_column(line: str, column: str):
+        start = column_starts[column]
+
+        later_columns = [
+            position
+            for name, position in column_starts.items()
+            if position > start
+        ]
+
+        end = min(later_columns) if later_columns else None
+
+        return line[start:end].strip() if start < len(line) else ""
+
+    current_band = None
+
+    mac_pattern = re.compile(
+        r"^\s*([0-9a-fA-F]{2}(?::[0-9a-fA-F]{2}){5})"
+    )
+
+    for line in lines[header_index + 1:]:
+        band_match = re.search(
+            r"(2\.4|5)\s*GHz",
+            line,
+            re.IGNORECASE,
+        )
+
+        if "#" in line and band_match:
+            current_band = (
+                "2.4GHz"
+                if band_match.group(1) == "2.4"
+                else "5GHz"
+            )
+            continue
+
+        mac_match = mac_pattern.match(line)
+
+        if not mac_match or current_band is None:
+            continue
+
+        def parse_int(value):
+            match = re.search(r"-?\d+", value)
+            return int(match.group()) if match else None
+
+        bandwidth_raw = get_column(line, "BandWidth")
+        bandwidth = parse_int(bandwidth_raw)
+
+        access_point = {
+            "bssid": mac_match.group(1).upper(),
+            "ssid": get_column(line, "SSID") or None,
+            "band": current_band,
+            "channel": parse_int(get_column(line, "Channel")),
+            "bandwidth_mhz": bandwidth,
+            "mimo": get_column(line, "MIMO") or None,
+            "rssi_dbm": parse_int(get_column(line, "RSSI")),
+            "wifi_mode": get_column(line, "Mode") or None,
+            "security": get_column(line, "Security") or None,
+            "wmm": get_column(line, "WMM") or None,
+            "noise_dbm": parse_int(get_column(line, "Noise")),
+            "max_bit_rate_mbps": parse_int(
+                get_column(line, "MaxBitRate")
+            ),
+        }
+
+        result["access_points"].append(access_point)
+
+    result["parsed_ap_count"] = len(result["access_points"])
+
+    return result
