@@ -202,12 +202,23 @@ def parse_network_interfaces(output: str) -> list[dict]:
             re.MULTILINE,
         )
 
+        # Distinguish administrative state (UP) from operational state
+        # (RUNNING). On this Nokia, eth2 can be administratively UP while
+        # lacking RUNNING; `lan stats` independently reports that port down.
+        flag_tokens = set(flags.group(1).split()) if flags else set()
+        administrative_status = (
+            "up" if "UP" in flag_tokens
+            else "down" if flags else None
+        )
+        operational_status = (
+            "up" if {"UP", "RUNNING"}.issubset(flag_tokens)
+            else "down" if flags else None
+        )
+
         interfaces.append({
             "interface": name,
-            "status": (
-                "up" if flags and "UP" in flags.group(1).split()
-                else "down" if flags else None
-            ),
+            "status": operational_status,
+            "administrative_status": administrative_status,
             "ipv4_address": ipv4.group(1) if ipv4 else None,
             "ipv6_addresses": ipv6 if ipv6 else [],
             "mtu": int(flags.group(2)) if flags else None,

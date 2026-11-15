@@ -1,4 +1,3 @@
-
 """Shared interactive SSH transport for network devices."""
 
 import logging
@@ -11,15 +10,22 @@ import paramiko
 
 logger = logging.getLogger(__name__)
 
-
-# Remove ANSI terminal escape sequences from received output.
 ANSI_ESCAPE = re.compile(
     r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])"
+)
+CONTROL_CHARS = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")
+
+DEVICE_ERROR_MARKERS = (
+    "ERROR::",
+    "ErrCode =",
+    "Error:",
+    "Unknown command",
+    "Invalid command",
+    "Command not found",
 )
 
 
 class SSHRouter:
-
     def __init__(
         self,
         host: str,
@@ -37,24 +43,32 @@ class SSHRouter:
         self.timeout = timeout
         self.legacy_rsa = legacy_rsa
 
-        self.prompt_pattern = re.compile(
-            rf"(?:^|[\r\n])(?:{prompt_pattern})[ \t]*$",
-            re.MULTILINE,
-        )
+        # Match the final prompt line, not the entire terminal transcript.
+        # Device-specific patterns are supplied by NokiaRouter/HuaweiRouter.
+        self.prompt_pattern = re.compile(prompt_pattern)
 
         self.client = None
         self.channel = None
 
+    @staticmethod
+    def _clean_output(output: str) -> str:
+        output = ANSI_ESCAPE.sub("", output)
+        output = CONTROL_CHARS.sub("", output)
+        return output.replace("\r", "")
+
+    def _is_prompt_received(self, output: str) -> bool:
+        lines = output.rstrip().splitlines()
+        if not lines:
+            return False
+        final_line = lines[-1].strip()
+        return bool(self.prompt_pattern.fullmatch(final_line))
+
     def connect(self):
         """Establish SSH connection."""
-
         self.client = paramiko.SSHClient()
 
-        # Temporary policy for initial LAN development.
-        # Replace with managed host-key verification later.
-        self.client.set_missing_host_key_policy(
-            paramiko.AutoAddPolicy()
-        )
+        # Temporary LAN-development policy. Use pinned host keys in production.
+        self.client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
 
         options = {
             "hostname": self.host,
@@ -75,19 +89,15 @@ class SSHRouter:
 
         try:
             self.client.connect(**options)
-
             logger.info("SSH connected: %s", self.host)
-
         except (paramiko.SSHException, socket.error) as exc:
             self.close()
-
             raise ConnectionError(
                 f"SSH connection failed for {self.host}: {exc}"
             ) from exc
 
     def open_shell(self):
         """Open an interactive shell and synchronize with its prompt."""
-
         if self.client is None:
             raise RuntimeError("SSH connection is not established")
 
@@ -96,92 +106,111 @@ class SSHRouter:
             width=160,
             height=48,
         )
-
         self.channel.settimeout(self.timeout)
 
         initial_output = self._read_until_prompt(self.timeout)
-
         logger.debug(
-            "Initial prompt received from %s: %s",
+            "Initial prompt received from %s: %r",
             self.host,
             initial_output[-100:],
         )
-
         return initial_output
 
     def _read_until_prompt(self, timeout=None):
-        """
-        Read channel output until the configured CLI prompt appears.
-
-        Unlike idle-based reading, this waits for an actual
-        command-completion signal from the router.
-        """
-
+        """Read output until the final line matches the router prompt."""
         if self.channel is None:
             raise RuntimeError("Interactive shell is not open")
 
-        timeout = timeout or self.timeout
-
+        timeout = self.timeout if timeout is None else timeout
         output = []
         start = time.monotonic()
 
         while time.monotonic() - start < timeout:
-
             if self.channel.closed:
                 raise ConnectionError(
                     f"SSH shell closed unexpectedly: {self.host}"
                 )
 
             if self.channel.recv_ready():
-
                 data = self.channel.recv(65535).decode(
                     "utf-8",
                     errors="replace",
                 )
-
                 output.append(data)
+                cleaned = self._clean_output("".join(output))
 
-                current_output = ANSI_ESCAPE.sub(
-                    "",
-                    "".join(output),
-                )
-
-                if self.prompt_pattern.search(current_output):
-                    return current_output
-
+                if self._is_prompt_received(cleaned):
+                    return cleaned
             else:
                 time.sleep(0.02)
 
-        partial_output = ANSI_ESCAPE.sub(
-            "",
-            "".join(output),
+        partial_output = self._clean_output("".join(output))
+        logger.error(
+            "[%s] Prompt detection failed. Last output: %r",
+            self.host,
+            partial_output[-160:],
         )
-
         raise TimeoutError(
-            f"Prompt not received from {self.host} "
-            f"within {timeout}s.\n"
+            f"Prompt not received from {self.host} within {timeout}s.\n"
             f"Partial output:\n{partial_output}"
         )
 
     def execute(self, command: str, timeout=None) -> str:
         """Execute one CLI command and wait for its prompt."""
-
         if self.channel is None or self.channel.closed:
             raise RuntimeError("Interactive shell is not available")
 
         logger.debug("[%s] Executing: %s", self.host, command)
-
         self.channel.sendall((command + "\n").encode("utf-8"))
-
         output = self._read_until_prompt(timeout)
-
         logger.debug("[%s] Command completed: %s", self.host, command)
-
         return output.strip()
+
+    def collect_raw_commands(self, commands):
+        """Collect optional command outputs without aborting the whole batch.
+
+        Each item is (key, command) or (key, command, timeout).
+        Device-level CLI errors are distinguished from SSH transport success.
+        """
+        results = {}
+
+        for item in commands:
+            key, command = item[0], item[1]
+            command_timeout = item[2] if len(item) > 2 else self.timeout
+
+            try:
+                output = self.execute(command, timeout=command_timeout)
+                has_device_error = any(
+                    marker.lower() in output.lower()
+                    for marker in DEVICE_ERROR_MARKERS
+                )
+
+                results[key] = {
+                    "command": command,
+                    "status": "command_error" if has_device_error else "success",
+                    "output": output,
+                    "error": (
+                        "Router returned a CLI error; inspect output."
+                        if has_device_error else None
+                    ),
+                }
+            except Exception as exc:
+                logger.exception(
+                    "[%s] Optional telemetry command failed: %s",
+                    self.host,
+                    command,
+                )
+                results[key] = {
+                    "command": command,
+                    "status": "collection_error",
+                    "output": None,
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+
+        return results
 
     def close(self):
         """Close shell and SSH connection safely."""
-
         if self.channel is not None:
             self.channel.close()
             self.channel = None

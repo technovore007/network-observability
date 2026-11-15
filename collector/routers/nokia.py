@@ -1,4 +1,3 @@
-
 """Nokia G-2425G-A router interface."""
 
 from datetime import datetime, timezone
@@ -14,22 +13,20 @@ class NokiaRouter(SSHRouter):
             host=host,
             username=username,
             password=password,
+            # Correct escaping: match user>, user#, user(show)#.
             prompt_pattern=r"user(?:\(show\))?[>#]",
             timeout=timeout,
         )
 
     def open_cli(self):
         """Initialize Nokia CLI in show mode."""
-
         self.open_shell()
         self.execute("enable")
         self.execute("show")
 
     def collect_system_metrics(self):
         """Collect and parse Nokia system telemetry."""
-
         collected_at = datetime.now(timezone.utc).isoformat()
-
         cpu_output = self.execute("cpu")
         memory_output = self.execute("mem")
         sysinfo_output = self.execute("sysinfo")
@@ -46,9 +43,7 @@ class NokiaRouter(SSHRouter):
 
     def collect_ethernet_metrics(self):
         """Collect Nokia Ethernet interface statistics."""
-
         collected_at = datetime.now(timezone.utc).isoformat()
-
         output = self.execute("lan stats")
 
         return {
@@ -59,9 +54,7 @@ class NokiaRouter(SSHRouter):
 
     def collect_network_interfaces(self):
         """Collect Nokia network interface statistics."""
-
         collected_at = datetime.now(timezone.utc).isoformat()
-
         output = self.execute("network interface all")
 
         return {
@@ -69,12 +62,10 @@ class NokiaRouter(SSHRouter):
             "collected_at": collected_at,
             "interfaces": nokia_parser.parse_network_interfaces(output),
         }
-    
+
     def collect_hosts(self):
         """Collect Nokia connected-host inventory."""
-
         collected_at = datetime.now(timezone.utc).isoformat()
-
         output = self.execute("lan ip hosts")
 
         return {
@@ -85,13 +76,46 @@ class NokiaRouter(SSHRouter):
 
     def collect_wifi_clients(self):
         """Collect Nokia associated Wi-Fi clients."""
-
         collected_at = datetime.now(timezone.utc).isoformat()
-
         output = self.execute("wifi client list")
 
         return {
             "device": "nokia",
             "collected_at": collected_at,
             "clients": nokia_parser.parse_wifi_clients(output),
+        }
+
+    def collect_extended_telemetry(self, include_neighbor_scan=False):
+        """Collect additional Nokia metadata, WAN, DHCP and neighbour data.
+
+        The `wlan` command performs a nearby-AP scan and writes scan data to
+        router flash. It is opt-in so it is not accidentally run every cycle.
+        """
+        commands = [
+            ("hardware_version", "hwversion"),
+            ("software_version", "swversion"),
+            ("build_information", "buildinfo"),
+            ("wan_status", "wan all status"),
+            ("wan_statistics", "wan all statistics"),
+            ("wan_uptime", "wan all uptime"),
+            ("dhcp_configuration", "lan ip dhcp"),
+            ("arp_table", "arp"),
+        ]
+
+        if include_neighbor_scan:
+            commands.append(("wifi_neighbor_scan", "wlan", 60))
+
+        return {
+            "device": "nokia",
+            "collected_at": datetime.now(timezone.utc).isoformat(),
+            "commands": self.collect_raw_commands(commands),
+            "notes": {
+                "primary_wan_interface": "ppp111",
+                "wan_rx_direction": "download",
+                "wan_tx_direction": "upload",
+                "wifi_neighbor_scan_included": include_neighbor_scan,
+                "wifi_neighbor_scan_warning": (
+                    "The wlan scan writes results to flash; do not poll rapidly."
+                ),
+            },
         }
